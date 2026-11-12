@@ -53,11 +53,34 @@ def on_signin_page(page):
     return "signin" in page.url.lower() or page.locator("#inputPassword").count() > 0
 
 
+def dismiss_cookie_banner(page):
+    """Close the OneTrust cookie popup (Reject All), then remove it if it is still there."""
+    for sel in ("#onetrust-reject-all-handler", "button.ot-pc-refuse-all-handler",
+                "#onetrust-accept-btn-handler"):
+        try:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click(timeout=5000)
+                time.sleep(1)
+                break
+        except Exception:
+            pass
+    page.evaluate(
+        "() => { const e = document.getElementById('onetrust-consent-sdk'); if (e) e.remove(); }"
+    )
+
+
 def login(page):
     page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
+    time.sleep(3)  # give the cookie popup time to appear
+    dismiss_cookie_banner(page)
     page.fill("#inputUserName", USERNAME)
     page.fill("#inputPassword", PASSWORD)
-    page.click("#submitButton")
+    try:
+        page.click("#submitButton", timeout=10000)
+    except Exception:
+        dismiss_cookie_banner(page)
+        page.press("#inputPassword", "Enter")
     page.wait_for_load_state("domcontentloaded", timeout=60000)
     time.sleep(4)
     return not on_signin_page(page)
@@ -69,6 +92,7 @@ def open_results(page):
     time.sleep(3)
     if on_signin_page(page):
         return None
+    dismiss_cookie_banner(page)
     body = page.inner_text("body")
     if "quick results" not in body.lower():
         link = page.locator("a[href*='ViewQuickResults']")
@@ -115,7 +139,17 @@ def main():
         browser = p.chromium.launch(headless=True)
         page = browser.new_context(locale="en-US").new_page()
 
-        if not login(page):
+        try:
+            ok = login(page)
+        except Exception as e:
+            print(now(), "sign-in page error:", type(e).__name__)
+            telegram(
+                f"⚠️ NCLEX watcher could not load the Pearson sign-in page ({now()}). "
+                "It will try again on the next run."
+            )
+            set_output("result", "run_finished")
+            return
+        if not ok:
             login_failed()
             return
 
