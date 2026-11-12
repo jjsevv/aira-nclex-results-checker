@@ -13,8 +13,13 @@ from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ["PEARSON_USERNAME"]
 PASSWORD = os.environ["PEARSON_PASSWORD"]
-TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+import re
+
+# Clean up common copy-paste mistakes: spaces, line breaks, "bot" prefix, full URLs.
+_raw_token = "".join(os.environ["TELEGRAM_BOT_TOKEN"].split())
+_m = re.search(r"\d+:[A-Za-z0-9_-]+", _raw_token)
+TG_TOKEN = _m.group(0) if _m else _raw_token
+TG_CHAT = "".join(os.environ["TELEGRAM_CHAT_ID"].split())
 
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "330"))          # how long one run keeps watching
 CHECK_EVERY = int(os.environ.get("CHECK_EVERY_SECONDS", "240"))  # 4 minutes between checks
