@@ -1,0 +1,180 @@
+"""
+NCLEX Quick Results watcher.
+Logs in to Pearson VUE, checks the Quick Results page every few minutes,
+and sends a Telegram message when results become available.
+"""
+import datetime
+import os
+import time
+import urllib.parse
+import urllib.request
+
+from playwright.sync_api import sync_playwright
+
+USERNAME = os.environ["PEARSON_USERNAME"]
+PASSWORD = os.environ["PEARSON_PASSWORD"]
+TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT = os.environ["TELEGRAM_CHAT_ID"]
+
+RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "330"))          # how long one run keeps watching
+CHECK_EVERY = int(os.environ.get("CHECK_EVERY_SECONDS", "240"))  # 4 minutes between checks
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+
+BASE = "https://wsr.pearsonvue.com"
+SIGNIN_URL = BASE + "/testtaker/signin/SignInPage/NCLEXTESTING"
+RESULTS_URL = BASE + "/testtaker/registration/ViewQuickResults/NCLEXTESTING"
+MANILA = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def now():
+    return datetime.datetime.now(MANILA).strftime("%a %d %b, %I:%M %p")
+
+
+def telegram(msg):
+    data = urllib.parse.urlencode(
+        {"chat_id": TG_CHAT, "text": msg, "disable_web_page_preview": "true"}
+    ).encode()
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data, timeout=20
+        )
+    except Exception as e:  # never print the token
+        print("Telegram send failed:", type(e).__name__)
+
+
+def set_output(key, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{key}={value}\n")
+
+
+def on_signin_page(page):
+    return "signin" in page.url.lower() or page.locator("#inputPassword").count() > 0
+
+
+def login(page):
+    page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=60000)
+    page.fill("#inputUserName", USERNAME)
+    page.fill("#inputPassword", PASSWORD)
+    page.click("#submitButton")
+    page.wait_for_load_state("domcontentloaded", timeout=60000)
+    time.sleep(4)
+    return not on_signin_page(page)
+
+
+def open_results(page):
+    """Returns the page text, or None if Pearson sent us back to sign-in."""
+    page.goto(RESULTS_URL, wait_until="domcontentloaded", timeout=60000)
+    time.sleep(3)
+    if on_signin_page(page):
+        return None
+    body = page.inner_text("body")
+    if "quick results" not in body.lower():
+        link = page.locator("a[href*='ViewQuickResults']")
+        if link.count() > 0:
+            link.first.click()
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+            time.sleep(3)
+            body = page.inner_text("body")
+    return body
+
+
+def classify(text):
+    t = text.lower()
+    if "results not available" in t or "not available at this time" in t:
+        return "NOT_READY"
+    if "quick results" in t:
+        return "READY"
+    return "UNKNOWN"
+
+
+LABELS = {
+    "NOT_READY": "Results not available yet",
+    "READY": "AVAILABLE",
+    "UNKNOWN": "Could not read the status",
+}
+
+
+def login_failed():
+    telegram(
+        f"⚠️ NCLEX watcher: Pearson login FAILED ({now()}).\n"
+        "The watcher has stopped itself so your account does not get locked.\n"
+        "Check the PEARSON_USERNAME and PEARSON_PASSWORD secrets, then re-enable the workflow."
+    )
+    set_output("result", "login_failed")
+
+
+def main():
+    deadline = time.time() + RUN_MINUTES * 60
+    first_check = True
+    unknown_alerted = False
+    errors_in_a_row = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(locale="en-US").new_page()
+
+        if not login(page):
+            login_failed()
+            return
+
+        while time.time() < deadline:
+            try:
+                text = open_results(page)
+                if text is None:  # session expired, log in again
+                    if not login(page):
+                        login_failed()
+                        return
+                    text = open_results(page) or ""
+                status = classify(text)
+                errors_in_a_row = 0
+                print(now(), status)
+
+                if first_check:
+                    first_check = False
+                    prefix = "🧪 TEST: " if TEST_MODE else "👀 "
+                    telegram(
+                        f"{prefix}NCLEX watcher is running ({now()}).\n"
+                        f"Current status: {LABELS[status]}.\n"
+                        f"Checking every {CHECK_EVERY // 60} minutes."
+                    )
+
+                if status == "READY":
+                    for _ in range(3):
+                        telegram(
+                            "🎉 NCLEX QUICK RESULTS ARE AVAILABLE!\n"
+                            f"Detected {now()}.\n"
+                            f"Log in and buy them here: {SIGNIN_URL}"
+                        )
+                        time.sleep(60)
+                    set_output("result", "ready")
+                    return
+
+                if status == "UNKNOWN" and not unknown_alerted:
+                    unknown_alerted = True
+                    telegram(
+                        f"❓ NCLEX watcher: the Quick Results page looked different ({now()}).\n"
+                        f"Please check it yourself: {SIGNIN_URL}"
+                    )
+
+                if TEST_MODE:
+                    set_output("result", "test_done")
+                    return
+
+            except Exception as e:
+                errors_in_a_row += 1
+                print(now(), "check error:", type(e).__name__)
+                if errors_in_a_row == 5:
+                    telegram(
+                        f"⚠️ NCLEX watcher: 5 failed checks in a row ({now()}). "
+                        "It will keep trying. If this repeats, check the Actions log on GitHub."
+                    )
+
+            time.sleep(CHECK_EVERY)
+
+        set_output("result", "run_finished")
+
+
+if __name__ == "__main__":
+    main()
