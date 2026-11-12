@@ -1,0 +1,52 @@
+name: NCLEX Quick Results watcher
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # queues the next run so watching never stops
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Test mode: run one check, send one message, then stop"
+        type: boolean
+        default: true
+
+# Only one run at a time. A new run waits in line until the current one ends.
+concurrency:
+  group: nclex-watcher
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install headless browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Watch Pearson VUE
+        id: watch
+        env:
+          PEARSON_USERNAME: ${{ secrets.PEARSON_USERNAME }}
+          PEARSON_PASSWORD: ${{ secrets.PEARSON_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: ${{ inputs.test_mode && 'true' || 'false' }}
+        run: python watcher.py
+
+      - name: Stop watching (results found or login failed)
+        if: steps.watch.outputs.result == 'ready' || steps.watch.outputs.result == 'login_failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "${{ github.workflow }}" --repo "${{ github.repository }}"
